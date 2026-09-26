@@ -5,7 +5,7 @@ Runs on any Python 3.8+. Zero install issues on Render free tier.
 import sqlite3
 import secrets
 import json
-import re
+import os
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -13,8 +13,8 @@ from urllib.parse import urlparse, parse_qs
 
 DB = Path(__file__).parent / "licenses.db"
 
-# ── Admin key (set this to a strong random string before deploying) ──
-ADMIN_KEY = "changeme-admin-key"
+# Admin key (set this to a strong random string before deploying)
+ADMIN_KEY = os.environ.get("ADMIN_LICENSE_KEY", "changeme-admin-key")
 
 def get_db():
     conn = sqlite3.connect(DB)
@@ -207,15 +207,14 @@ class LicenseHandler(BaseHTTPRequestHandler):
             _json_response(self, {"detail": "Not found"}, 404)
 
     def log_message(self, format, *args):
-        pass  # suppress logs
+        pass
 
-def run_server(host="0.0.0.0", port=10000):
+def run_server():
     init_db()
-    server = HTTPServer((host, port), LicenseHandler)
-    print(f"License server running on http://{host}:{port}")
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), LicenseHandler)
+    print(f"License server running on port {port}")
     server.serve_forever()
 
 if __name__ == "__main__":
-    import sys
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 10000
-    run_server(port=port)
+    run_server()
