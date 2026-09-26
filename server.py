@@ -1,13 +1,10 @@
-"""
-License Server — Email Finder Agent
-Deploy on any free-tier host (Render, PythonAnywhere, Fly.io, etc.)
-FastAPI + SQLite, zero external dependencies.
+"""License Server — Email Finder Agent
+Deploy on Render free tier. FastAPI + SQLite, zero external dependencies.
 """
 import sqlite3
 import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
-from contextlib import contextmanager
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,7 +22,7 @@ DB = Path(__file__).parent / "licenses.db"
 
 class ActivateRequest(BaseModel):
     key: str
-    machine_id: str  # optional fingerprint
+    machine_id: str = ""
 
 class KillRequest(BaseModel):
     key: str
@@ -58,10 +55,6 @@ def init_db():
         """)
         conn.commit()
 
-@app.on_event("startup")
-def startup():
-    init_db()
-
 def _row_to_dict(row):
     return dict(row) if row else None
 
@@ -71,7 +64,7 @@ def health():
 
 @app.post("/api/license/validate")
 def validate_license(key: str):
-    """Check if license is active. Returns {active, expires, company}."""
+    """Check if license is active."""
     with get_db() as conn:
         row = conn.execute(
             "SELECT * FROM licenses WHERE key = ?", (key,)
@@ -80,7 +73,6 @@ def validate_license(key: str):
             raise HTTPException(404, "License not found")
         license = _row_to_dict(row)
         
-        # Update last seen
         conn.execute(
             "UPDATE licenses SET last_seen = ? WHERE key = ?",
             (datetime.utcnow().isoformat(), key)
@@ -104,7 +96,7 @@ def validate_license(key: str):
 
 @app.post("/api/license/activate")
 def activate_license(req: ActivateRequest):
-    """Record activation (optional)."""
+    """Record activation."""
     with get_db() as conn:
         conn.execute(
             """INSERT INTO activations (license_key, machine_id, activated_at)
@@ -120,8 +112,8 @@ def activate_license(req: ActivateRequest):
 
 @app.post("/api/license/deactivate")
 def deactivate_license(req: KillRequest):
-    """Admin endpoint to deactivate a license."""
-    ADMIN_KEY = secrets.token_hex(32)  # Set this in production
+    """Admin: deactivate a license."""
+    ADMIN_KEY = "changeme-admin-key"
     if req.admin_key != ADMIN_KEY:
         raise HTTPException(403, "Unauthorized")
     
@@ -139,8 +131,8 @@ def deactivate_license(req: KillRequest):
 
 @app.post("/api/license/delete")
 def delete_license(req: KillRequest):
-    """Admin endpoint to delete a license."""
-    ADMIN_KEY = secrets.token_hex(32)
+    """Admin: delete a license."""
+    ADMIN_KEY = "changeme-admin-key"
     if req.admin_key != ADMIN_KEY:
         raise HTTPException(403, "Unauthorized")
     
@@ -156,8 +148,8 @@ def delete_license(req: KillRequest):
 
 @app.get("/api/license/list")
 def list_licenses(admin_key: str):
-    """List all licenses (admin only)."""
-    ADMIN_KEY = secrets.token_hex(32)
+    """Admin: list all licenses."""
+    ADMIN_KEY = "changeme-admin-key"
     if admin_key != ADMIN_KEY:
         raise HTTPException(403, "Unauthorized")
     
@@ -167,8 +159,8 @@ def list_licenses(admin_key: str):
 
 @app.post("/api/license/add")
 def add_license(company: str, days: int = 365, admin_key: str = ""):
-    """Create a new license (admin only)."""
-    ADMIN_KEY = secrets.token_hex(32)
+    """Admin: create a new license."""
+    ADMIN_KEY = "changeme-admin-key"
     if admin_key != ADMIN_KEY:
         raise HTTPException(403, "Unauthorized")
     
@@ -184,3 +176,6 @@ def add_license(company: str, days: int = 365, admin_key: str = ""):
         conn.commit()
     
     return {"key": key, "company": company, "expires_at": expires.isoformat() if expires else None}
+
+# Initialize DB on first request
+init_db()
