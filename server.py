@@ -1,32 +1,20 @@
 """License Server — Email Finder Agent
-Deploy on Render free tier. FastAPI + SQLite, zero external dependencies.
+Pure Python stdlib HTTP server. No external dependencies.
+Runs on any Python 3.8+. Zero install issues on Render free tier.
 """
 import sqlite3
 import secrets
+import json
+import re
 from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
-
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-
-app = FastAPI(title="Email Finder License Server")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+from urllib.parse import urlparse, parse_qs
 
 DB = Path(__file__).parent / "licenses.db"
 
-class ActivateRequest(BaseModel):
-    key: str
-    machine_id: str = ""
-
-class KillRequest(BaseModel):
-    key: str
-    admin_key: str
+# ── Admin key (set this to a strong random string before deploying) ──
+ADMIN_KEY = "changeme-admin-key"
 
 def get_db():
     conn = sqlite3.connect(DB)
@@ -58,124 +46,176 @@ def init_db():
 def _row_to_dict(row):
     return dict(row) if row else None
 
-@app.get("/api/license/health")
-def health():
-    return {"status": "ok"}
+def _json_response(handler, data, status=200):
+    body = json.dumps(data).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+    handler.end_headers()
+    handler.wfile.write(body)
 
-@app.post("/api/license/validate")
-def validate_license(key: str):
-    """Check if license is active."""
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT * FROM licenses WHERE key = ?", (key,)
-        ).fetchone()
-        if not row:
-            raise HTTPException(404, "License not found")
-        license = _row_to_dict(row)
-        
-        conn.execute(
-            "UPDATE licenses SET last_seen = ? WHERE key = ?",
-            (datetime.utcnow().isoformat(), key)
-        )
-        conn.commit()
-        
-        if not license["active"]:
-            return {"active": False, "reason": "License deactivated"}
-        
-        if license["expires_at"]:
-            expires = datetime.fromisoformat(license["expires_at"])
-            if expires < datetime.utcnow():
-                return {"active": False, "reason": "License expired"}
-        
-        return {
-            "active": True,
-            "company": license["company"],
-            "expires_at": license["expires_at"],
-            "version": "1.0.0"
-        }
+def _read_body(handler):
+    length = int(handler.headers.get("Content-Length", 0))
+    if length > 0:
+        return json.loads(handler.rfile.read(length).decode("utf-8"))
+    return {}
 
-@app.post("/api/license/activate")
-def activate_license(req: ActivateRequest):
-    """Record activation."""
-    with get_db() as conn:
-        conn.execute(
-            """INSERT INTO activations (license_key, machine_id, activated_at)
-               VALUES (?, ?, ?)""",
-            (req.key, req.machine_id, datetime.utcnow().isoformat())
-        )
-        conn.execute(
-            "UPDATE licenses SET last_seen = ? WHERE key = ?",
-            (datetime.utcnow().isoformat(), req.key)
-        )
-        conn.commit()
-    return {"status": "activated"}
+class LicenseHandler(BaseHTTPRequestHandler):
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
 
-@app.post("/api/license/deactivate")
-def deactivate_license(req: KillRequest):
-    """Admin: deactivate a license."""
-    ADMIN_KEY = "changeme-admin-key"
-    if req.admin_key != ADMIN_KEY:
-        raise HTTPException(403, "Unauthorized")
-    
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT key FROM licenses WHERE key = ?", (req.key,)
-        ).fetchone()
-        if not row:
-            raise HTTPException(404, "License not found")
-        conn.execute(
-            "UPDATE licenses SET active = 0 WHERE key = ?", (req.key,)
-        )
-        conn.commit()
-    return {"status": "deactivated"}
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        params = parse_qs(parsed.query)
 
-@app.post("/api/license/delete")
-def delete_license(req: KillRequest):
-    """Admin: delete a license."""
-    ADMIN_KEY = "changeme-admin-key"
-    if req.admin_key != ADMIN_KEY:
-        raise HTTPException(403, "Unauthorized")
-    
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT key FROM licenses WHERE key = ?", (req.key,)
-        ).fetchone()
-        if not row:
-            raise HTTPException(404, "License not found")
-        conn.execute("DELETE FROM licenses WHERE key = ?", (req.key,))
-        conn.commit()
-    return {"status": "deleted"}
+        if path == "/api/license/health":
+            _json_response(self, {"status": "ok"})
 
-@app.get("/api/license/list")
-def list_licenses(admin_key: str):
-    """Admin: list all licenses."""
-    ADMIN_KEY = "changeme-admin-key"
-    if admin_key != ADMIN_KEY:
-        raise HTTPException(403, "Unauthorized")
-    
-    with get_db() as conn:
-        rows = conn.execute("SELECT * FROM licenses ORDER BY created_at DESC").fetchall()
-    return [_row_to_dict(r) for r in rows]
+        elif path == "/api/license/list":
+            ak = params.get("admin_key", [""])[0]
+            if ak != ADMIN_KEY:
+                _json_response(self, {"detail": "Unauthorized"}, 403)
+                return
+            with get_db() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM licenses ORDER BY created_at DESC"
+                ).fetchall()
+            _json_response(self, [_row_to_dict(r) for r in rows])
 
-@app.post("/api/license/add")
-def add_license(company: str, days: int = 365, admin_key: str = ""):
-    """Admin: create a new license."""
-    ADMIN_KEY = "changeme-admin-key"
-    if admin_key != ADMIN_KEY:
-        raise HTTPException(403, "Unauthorized")
-    
-    key = f"EF-{secrets.token_hex(8).upper()}"
-    expires = datetime.utcnow() + timedelta(days=days) if days > 0 else None
-    
-    with get_db() as conn:
-        conn.execute(
-            """INSERT INTO licenses (key, company, active, expires_at, created_at)
-               VALUES (?, ?, 1, ?, ?)""",
-            (key, company, expires.isoformat() if expires else None, datetime.utcnow().isoformat())
-        )
-        conn.commit()
-    
-    return {"key": key, "company": company, "expires_at": expires.isoformat() if expires else None}
+        elif path == "/api/license/validate":
+            key = params.get("key", [""])[0]
+            if not key:
+                _json_response(self, {"detail": "key required"}, 400)
+                return
+            with get_db() as conn:
+                row = conn.execute(
+                    "SELECT * FROM licenses WHERE key = ?", (key,)
+                ).fetchone()
+                if not row:
+                    _json_response(self, {"active": False, "reason": "License not found"}, 404)
+                    return
+                lic = _row_to_dict(row)
+                conn.execute(
+                    "UPDATE licenses SET last_seen = ? WHERE key = ?",
+                    (datetime.utcnow().isoformat(), key)
+                )
+                conn.commit()
+                if not lic["active"]:
+                    _json_response(self, {"active": False, "reason": "License deactivated"})
+                    return
+                if lic["expires_at"]:
+                    expires = datetime.fromisoformat(lic["expires_at"])
+                    if expires < datetime.utcnow():
+                        _json_response(self, {"active": False, "reason": "License expired"})
+                        return
+                _json_response(self, {
+                    "active": True,
+                    "company": lic["company"],
+                    "expires_at": lic["expires_at"],
+                    "version": "1.0.0"
+                })
+        else:
+            _json_response(self, {"detail": "Not found"}, 404)
 
-# Initialize DB on first request
-init_db()
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
+        body = _read_body(self)
+
+        if path == "/api/license/activate":
+            key = body.get("key", "")
+            machine_id = body.get("machine_id", "")
+            if not key:
+                _json_response(self, {"detail": "key required"}, 400)
+                return
+            with get_db() as conn:
+                conn.execute(
+                    """INSERT INTO activations (license_key, machine_id, activated_at)
+                       VALUES (?, ?, ?)""",
+                    (key, machine_id, datetime.utcnow().isoformat())
+                )
+                conn.execute(
+                    "UPDATE licenses SET last_seen = ? WHERE key = ?",
+                    (datetime.utcnow().isoformat(), key)
+                )
+                conn.commit()
+            _json_response(self, {"status": "activated"})
+
+        elif path == "/api/license/deactivate":
+            if body.get("admin_key") != ADMIN_KEY:
+                _json_response(self, {"detail": "Unauthorized"}, 403)
+                return
+            key = body.get("key", "")
+            with get_db() as conn:
+                row = conn.execute(
+                    "SELECT key FROM licenses WHERE key = ?", (key,)
+                ).fetchone()
+                if not row:
+                    _json_response(self, {"detail": "License not found"}, 404)
+                    return
+                conn.execute(
+                    "UPDATE licenses SET active = 0 WHERE key = ?", (key,)
+                )
+                conn.commit()
+            _json_response(self, {"status": "deactivated"})
+
+        elif path == "/api/license/delete":
+            if body.get("admin_key") != ADMIN_KEY:
+                _json_response(self, {"detail": "Unauthorized"}, 403)
+                return
+            key = body.get("key", "")
+            with get_db() as conn:
+                row = conn.execute(
+                    "SELECT key FROM licenses WHERE key = ?", (key,)
+                ).fetchone()
+                if not row:
+                    _json_response(self, {"detail": "License not found"}, 404)
+                    return
+                conn.execute("DELETE FROM licenses WHERE key = ?", (key,))
+                conn.commit()
+            _json_response(self, {"status": "deleted"})
+
+        elif path == "/api/license/add":
+            company = body.get("company", "")
+            days = int(body.get("days", 365))
+            if body.get("admin_key") != ADMIN_KEY:
+                _json_response(self, {"detail": "Unauthorized"}, 403)
+                return
+            key = f"EF-{secrets.token_hex(8).upper()}"
+            expires = datetime.utcnow() + timedelta(days=days) if days > 0 else None
+            with get_db() as conn:
+                conn.execute(
+                    """INSERT INTO licenses (key, company, active, expires_at, created_at)
+                       VALUES (?, ?, 1, ?, ?)""",
+                    (key, company, expires.isoformat() if expires else None,
+                     datetime.utcnow().isoformat())
+                )
+                conn.commit()
+            _json_response(self, {
+                "key": key, "company": company,
+                "expires_at": expires.isoformat() if expires else None
+            })
+        else:
+            _json_response(self, {"detail": "Not found"}, 404)
+
+    def log_message(self, format, *args):
+        pass  # suppress logs
+
+def run_server(host="0.0.0.0", port=10000):
+    init_db()
+    server = HTTPServer((host, port), LicenseHandler)
+    print(f"License server running on http://{host}:{port}")
+    server.serve_forever()
+
+if __name__ == "__main__":
+    import sys
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 10000
+    run_server(port=port)
